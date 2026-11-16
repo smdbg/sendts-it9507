@@ -80,6 +80,9 @@ sendts-it9507 --list
 sendts-it9507 --probe --serial YOUR_USB_SERIAL
 ```
 
+Use the **USB dongle serial number** shown by `sendts-it9507 --list` as the
+value of `--serial`.
+
 `--list` reads USB descriptors without initializing the transmitter.
 `--probe` claims interface 0 and queries LINK/OFDM firmware versions only. It
 does not upload firmware, reset the USB device, change modulation registers
@@ -152,7 +155,7 @@ batch. There are no per-packet sleeps or software codec operations.
 | `--probe` | Query firmware versions without changing RF state |
 | `--transmit` | Initialize, configure RF and send stdin |
 | `--muxrate` / `-m` | Print TS capacity in bits/s without USB access |
-| `--serial SERIAL` | Select an exact USB serial |
+| `--serial SERIAL` | USB dongle serial number; shown by `--list` |
 | `--device N` / `-d N` | Zero-based enumeration index; default 0 |
 | `--frequency KHZ` / `-f KHZ` | Required for transmission; 174000..862000 |
 | `--bandwidth KHZ` / `-b KHZ` | 6000, 7000 or 8000; default 8000 |
