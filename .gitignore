@@ -1,0 +1,5 @@
+/sendts-it9507
+/test-protocol
+*.o
+__pycache__/
+*.pyc

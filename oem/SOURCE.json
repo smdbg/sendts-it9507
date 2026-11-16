@@ -1,0 +1,103 @@
+{
+  "source": "Operator supplied UT-100 CD v2.4_20221221_withDEC",
+  "sdk": "SDK_Linux/it950x_linux_v18.04.16.2/it950x_driver",
+  "tx_api": "1.3.20160929.0",
+  "driver_identification": "v18.04.16.1",
+  "files": [
+    {
+      "file": "ADF4351.c",
+      "sdk_path": "api/ADF4351.c",
+      "sdk_sha256": "73b90c60c14e5ac2d0ba0eacd5d6df4c6be5002be3975c107e115ec4d1ea263a"
+    },
+    {
+      "file": "ADF4351.h",
+      "sdk_path": "api/ADF4351.h",
+      "sdk_sha256": "bb5ee203d81db771648de8ee536467038f194defc38ae61794665eeffd79251a"
+    },
+    {
+      "file": "Common.h",
+      "sdk_path": "api/Common.h",
+      "sdk_sha256": "26277cd73cf3cacb4b31564ffc4cc15b050e2b8a4cfab14290ac96d9cc7601e8"
+    },
+    {
+      "file": "IQ_fixed_table.h",
+      "sdk_path": "api/IQ_fixed_table.h",
+      "sdk_sha256": "40e289a841c6cd31bb6837aa8d97c619a070e1790f4fd98ff894e9e8a59c30db"
+    },
+    {
+      "file": "IT9507.c",
+      "sdk_path": "api/IT9507.c",
+      "sdk_sha256": "e5cdda3e9aa5739648ecf978cb60f0224c061845ba77cad468ecc5af3164d4b3"
+    },
+    {
+      "file": "IT9507.h",
+      "sdk_path": "api/IT9507.h",
+      "sdk_sha256": "2e5f012ac17c68507623fb91b9982243d795b23d0fb355336fe9f9b7c44a49b2"
+    },
+    {
+      "file": "af9035u2iimpl.h",
+      "sdk_path": "api/af9035u2iimpl.h",
+      "sdk_sha256": "eab9af98449944657d5e87affd5429bcc66fd905ed6f68c50174b15f5df760d1"
+    },
+    {
+      "file": "eagleTuner.c",
+      "sdk_path": "api/eagleTuner.c",
+      "sdk_sha256": "4260ed8c91f36ba1c92d8c6a221adfeb4d0d84784910c96c614a7c1211584373"
+    },
+    {
+      "file": "eagleTuner.h",
+      "sdk_path": "api/eagleTuner.h",
+      "sdk_sha256": "c14ca6551351a7df252966c78dbf4a842af6c9c559a07b0e5098f2433b3cbc23"
+    },
+    {
+      "file": "i2cimpl.h",
+      "sdk_path": "api/i2cimpl.h",
+      "sdk_sha256": "816b1517d2677c28afd816fc846aea0afb971073362c4ad94d8451725a149ce3"
+    },
+    {
+      "file": "modulatorError.h",
+      "sdk_path": "api/modulatorError.h",
+      "sdk_sha256": "d5e05958819a0dafb770eba36cc63be991a4752eba663ba03ed947b939312aca"
+    },
+    {
+      "file": "modulatorFirmware.h",
+      "sdk_path": "api/modulatorFirmware.h",
+      "sdk_sha256": "cee358bfe9508417f5472aab4bf33849e19f93bb859678c5ffcbc0692bd8e686"
+    },
+    {
+      "file": "modulatorRegister.h",
+      "sdk_path": "api/modulatorRegister.h",
+      "sdk_sha256": "3bc55099091443902a3149777de429cc8090d3cb00c8325c6a36f07090f6ce6f"
+    },
+    {
+      "file": "modulatorType.h",
+      "sdk_path": "src/modulatorType.h",
+      "sdk_sha256": "2d74b11df097cb8f46df5b1eefe65b976b9533d4244b9941e273f06f6f42db10"
+    },
+    {
+      "file": "modulatorUser.c",
+      "sdk_path": "api/modulatorUser.c",
+      "sdk_sha256": "a71a2001631653f105e9a65194b76fbccc30e63e574818dedb412f4677cf6700"
+    },
+    {
+      "file": "modulatorUser.h",
+      "sdk_path": "api/modulatorUser.h",
+      "sdk_sha256": "bc61971f81c15e6854d25d3fb23c2aaf902e791b9a5a4363e360754a8e55f9ee"
+    },
+    {
+      "file": "modulatorVariable.h",
+      "sdk_path": "api/modulatorVariable.h",
+      "sdk_sha256": "4c0ef3b95d7dd4a22be003ccd2afc8f782d4971f51f1b4937db09addb0636425"
+    },
+    {
+      "file": "modulatorVersion.h",
+      "sdk_path": "api/modulatorVersion.h",
+      "sdk_sha256": "c851eb2e91511f92a96e07eed28aef7b87cd3484c42349fac53d412c61d2aef9"
+    },
+    {
+      "file": "usb2impl.h",
+      "sdk_path": "src/usb2impl.h",
+      "sdk_sha256": "01b7a6c8dfbf1ae9e62834f05c04561cdc12de47ff8cb5e18ed2a51d51bd6ba0"
+    }
+  ]
+}

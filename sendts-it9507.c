@@ -16,7 +16,10 @@
  * See http://www.gnu.org/ for license details.
  */
 
-// FIXME: reboot for devices that do not need firmware load on connect
+/* Modified for the smdbg integration, 2026-11-16: explicit transmit mode,
+ * non-transmitting firmware probe,
+ * validated options, bounded synchronous USB writes and RF shutdown on exit.
+ * See README.md for provenance and limitations. */
 
 #include <stdio.h>
 #include <errno.h>
@@ -25,13 +28,18 @@
 #include <unistd.h>
 #include <endian.h>
 #include <getopt.h>
+#include <limits.h>
+#include <signal.h>
+#include <poll.h>
+#include <time.h>
 
 #include <libusb.h>
+#include "oem_bridge.h"
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
-#define DVB_OFDM_VERSION		0xff090800U
-#define DVB_LINK_VERSION		0xff270200U
+#define DVB_OFDM_VERSION		0xff090c00U
+#define DVB_LINK_VERSION		0xff270300U
 
 /* Commands */
 #define Command_REG_DEMOD_READ		0x0000
@@ -196,7 +204,7 @@ struct it950x_dev {
 	/* Configurable modulation parameters */
 	int gain;
 	int frequency_khz;
-	int bandwidth_hz;
+	int bandwidth_khz;
 	int transmission_mode;
 	int constellation;
 	int guard_interval;
@@ -205,6 +213,7 @@ struct it950x_dev {
 
 	/* State */
 	int error;
+	int configuration_started;
 	uint16_t c1val, c2val, c3val;
 };
 
@@ -251,11 +260,11 @@ struct it950x_reply {
 static uint16_t it9507_checksum(const void *ptr, size_t len)
 {
 	uint8_t *pdu = (uint8_t *) ptr;
-	uint16_t *pdu16 = (uint16_t *) ptr, csum = 0;
+	uint16_t csum = 0;
 	size_t i;
 
 	for (i = 0; i < len / 2; i++)
-		csum += be16toh(pdu16[i]);
+		csum += ((uint16_t)pdu[2*i] << 8) | pdu[2*i+1];
 	if (len & 1)
 		csum += pdu[len-1] << 8;
 
@@ -264,7 +273,7 @@ static uint16_t it9507_checksum(const void *ptr, size_t len)
 
 static void hexdump(const char *msg, const char *ptr, size_t ptrlen)
 {
-	int i;
+	size_t i;
 
 	if (verbose < 3)
 		return;
@@ -327,7 +336,7 @@ static int it9507_talk(struct it950x_dev *dev, struct it950x_req *req, struct it
 	/* Read data */
 	r = it9507_bus_rx(dev, rep, sizeof(*rep));
 	if (r < 3+2) goto errio;
-	if (rep->length > r) goto errio;
+	if (rep->length < 4 || rep->length + 1 != r || rep->seq != req->seq) goto errio;
 
 	csum = it9507_checksum(&rep->seq, rep->length - 2);
 	rep->length -= 2 + 2;
@@ -431,47 +440,7 @@ static uint32_t it9507_get_fwver(struct it950x_dev *dev, uint16_t cpu)
 	r = it9507_talk(dev, &req, &rep);
 	if (r < 0) return -1;
 	if (rep.length != 4) return -1;
-	return rep.payload[0] << 24 | rep.payload[1] << 16 | rep.payload[2] << 8 | rep.payload[3];
-}
-
-static int it950x_load_firmware(struct it950x_dev *dev)
-{
-	/* ITE driver uploads 23 chunks of 48 bytes, then 1 chunk of 14,
-	   then 71 chunks of 48 bytes, then 1 chunk of 34. */
-	#include "firmware.h"
-	static const int chunk_sizes[] = {
-		48, 23,
-		14, 1,
-		48, 71,
-		34, 1,
-		0
-	};
-	const uint8_t *p;
-	struct it950x_req req;
-	struct it950x_reply rep;
-	int r, i, j;
-
-	it950x_wr_reg(dev, Processor_LINK, p_eagle_reg_lnk2ofdm_data_63_56, EagleUser_IIC_SPEED);
-
-	p = EagleFirmware_codes;
-	for (j = 0; chunk_sizes[j]; j += 2) {
-		for (i = 0; i < chunk_sizes[j + 1]; i++) {
-			req.command = htobe16(Processor_LINK | Command_SCATTER_WRITE);
-			req.length = chunk_sizes[j];
-			memcpy(req.payload, p, req.length);
-
-			if (it9507_talk(dev, &req, &rep) < 0)
-				return dev->error;
-
-			p += chunk_sizes[j];
-		}
-	}
-
-	req.command = htobe16(Processor_LINK | Command_BOOT);
-	req.length = 0;
-	r = it9507_talk(dev, &req, &rep);
-	if (r == 0) usleep(10000);
-	return r;
+	return (uint32_t)rep.payload[0] << 24 | rep.payload[1] << 16 | rep.payload[2] << 8 | rep.payload[3];
 }
 
 static int it9507_power_up(struct it950x_dev *dev)
@@ -529,7 +498,7 @@ static int it9507_enable_xmit(struct it950x_dev *dev)
 	return dev->error;
 }
 
-unsigned int IT9507_getLoFreq(unsigned int rf_freq_kHz)
+static unsigned int IT9507_getLoFreq(unsigned int rf_freq_kHz)
 {
 	static const unsigned char nvmap[] = { 48, 32, 24, 16, 12, 8, 6, 4, 2, 2 };
 	unsigned int c_fN_min[9];
@@ -585,10 +554,10 @@ static int it9507_set_bandwidth(struct it950x_dev *dev)
 		{ 7000, { 0x76, 0x02, 0x01, 0x03, 0x02 } },
 		{ 8000, { 0x1e, 0x02, 0x01, 0x03, 0x02 } },
 	};
-	int cfg;
+	size_t cfg;
 
 	for (cfg = 0; cfg < sizeof(configs)/sizeof(configs[0]); cfg++)
-		if (configs[cfg].bandwidth == dev->bandwidth_hz)
+		if (configs[cfg].bandwidth == dev->bandwidth_khz)
 			break;
 	if (cfg >= sizeof(configs)/sizeof(configs[0]))
 		return -EINVAL;
@@ -835,11 +804,11 @@ static int interpolation(int fIn, int *ptrdAmp, int *ptrdPhi)
 	int temp1, temp2, temp3, temp4;
 	int i;
 
-	for (i = 0; iqtable[i].frequency && i+1 < num_entries; i++) {
+	for (i = 0; i+1 < num_entries && iqtable[i].frequency; i++) {
 		if (fIn >= iqtable[i].frequency && fIn < iqtable[i+1].frequency)
 			break;
 	}
-	if (fIn < iqtable[i].frequency || fIn > iqtable[i+1].frequency)
+	if (i+1 >= num_entries || fIn < iqtable[i].frequency || fIn > iqtable[i+1].frequency)
 		return -1;
 	if (fIn != iqtable[i].frequency &&
 	    iqtable[i+1].frequency - iqtable[i].frequency > 100000)
@@ -901,7 +870,7 @@ static int EagleTuner_setIQCalibration(struct it950x_dev *dev)
 		val[3] = 0x00;
 		val[4] = 0x00;
 		val[5] = 0x02;
-		it950x_wr_regs(dev, Processor_OFDM, 0, val, 6);
+		it950x_wr_regs(dev, Processor_OFDM, p_eagle_reg_iqik_c1_7_0, val, 6);
 		return -1;
 	}
 
@@ -958,7 +927,7 @@ static int it9507_set_frequency(struct it950x_dev *dev)
 
 static int it9507_configure(struct it950x_dev *dev)
 {
-	it9507_set_bandwidth(dev);
+	if (it9507_set_bandwidth(dev) < 0) return dev->error = -EINVAL;
 	it9507_set_frequency(dev);
 
 	/* EagleUser_acquireChannel: set uvFilter */
@@ -974,7 +943,7 @@ static int it9507_configure(struct it950x_dev *dev)
 	it950x_wr_reg(dev, Processor_OFDM, 0xf7C6, 1);
 	it950x_wr_reg(dev, Processor_OFDM, 0xF727, dev->cell_id >> 8);
 	it950x_wr_reg(dev, Processor_OFDM, 0xF728, dev->cell_id);
-	return it9507_enable_xmit(dev);
+	return dev->error;
 }
 
 static int it950x_set_ts_interface(struct it950x_dev *dev)
@@ -1104,7 +1073,8 @@ static int it950x_adjust_gain(struct it950x_dev *dev)
 	int c1value = 0, c2value = 0, c3value = 0;
 	int c1value_default, c2value_default, c3value_default;
 	uint32_t amp_mul_max1 = 0, amp_mul_max2 = 0, amp_mul_max3 = 0;
-	int i = 0, amp_mul, amp_mul_max = 0;
+	int i = 0, amp_mul;
+	uint32_t amp_mul_max = 0;
 	int gain_X10 = dev->gain * 10;
 	int overflow = 0;
 
@@ -1116,6 +1086,7 @@ static int it950x_adjust_gain(struct it950x_dev *dev)
 	if (c2value_default > 1023) c2value_default = c2value_default - 2048;
 	if (c3value_default > 1023) c3value_default = c3value_default - 2048;
 
+	if (!c1value_default || !c3value_default) return dev->error = -EINVAL;
 	amp_mul_max1 = 10000 * 1023 / abs(c1value_default);
 	if (c2value_default != 0)
 		amp_mul_max2 = 10000 * 1023 / abs(c2value_default);
@@ -1133,7 +1104,7 @@ static int it950x_adjust_gain(struct it950x_dev *dev)
 		//d_amp_mul = 1;
 		amp_mul = 10000;
 		for (i = 0; i < gain_X10; i += 10) {
-			if (amp_mul_max > amp_mul) {
+			if (amp_mul_max > (uint32_t)amp_mul) {
 				amp_mul = amp_mul * 11220 / 10000;
 				c1value = c1value_default * amp_mul / 10000;
 				c2value = c2value_default * amp_mul / 10000;
@@ -1158,7 +1129,7 @@ static int it950x_adjust_gain(struct it950x_dev *dev)
 		//d_amp_mul = 1;
 		amp_mul = 10000;
 		for (i = 0; i > gain_X10; i -= 10) {
-			if (amp_mul_max > amp_mul) {
+			if (amp_mul_max > (uint32_t)amp_mul) {
 				//d_amp_mul *= 0.501;
 				amp_mul = amp_mul * 8910 / 10000;
 				c1value = c1value_default * amp_mul / 10000;
@@ -1210,14 +1181,7 @@ static int it950x_init(struct it950x_dev *dev)
 	r = it950x_wr_reg(dev, Processor_LINK, second_i2c_address, 0x00);
 	if (r < 0) return r;
 
-	if (ver_link == 0) {
-		/* Firmware upload required */
-		r = it950x_load_firmware(dev);
-		if (r < 0) return r;
-
-		ver_link = it9507_get_fwver(dev, Processor_LINK);
-		if (ver_link == 0xffffffff) return -EIO;
-	}
+	if (ver_link == 0) return -EIO; /* OEM initialization must have booted RAM firmware. */
 	ver_ofdm = it9507_get_fwver(dev, Processor_OFDM);
 
 	fprintf(stderr,
@@ -1228,6 +1192,8 @@ static int it950x_init(struct it950x_dev *dev)
 	if (ver_ofdm != DVB_OFDM_VERSION ||
 	    ver_link != DVB_LINK_VERSION)
 		return -ENOTSUP;
+
+	dev->configuration_started = 1;
 
 	/* IT9507_initialize */
 
@@ -1293,90 +1259,72 @@ static int it950x_init(struct it950x_dev *dev)
 	it9507_power_up(dev);
 	it9507_configure(dev);
 	it950x_adjust_gain(dev);
+	if (!dev->error) it9507_enable_xmit(dev);
 
 	return dev->error;
 }
 
-static int do_read(int fd, unsigned char *buf, int bytes)
+static volatile sig_atomic_t stopping;
+
+static void stop_signal(int signo)
 {
-	int r, left;
-
-	for (left = bytes; left; ) {
-		r = read(fd, buf, left);
-		if (r <= 0) {
-			if (r == 0) return bytes - left;
-			return -errno;
-		}
-		left -= r;
-		buf += r;
-	}
-
-	return bytes;
+	(void)signo;
+	stopping = 1;
 }
 
-struct transfer {
-	int in_flight : 1;
-	uint8_t *buf;
-	struct libusb_transfer *xfer;
-};
-
-static void it950x_buffer_done(struct libusb_transfer *xfer)
+/* VBR TS input: coalesce available packets, flushing a partial batch after
+ * 10 ms. The modulator supplies RF stuffing; this program generates no NULLs. */
+static int64_t monotonic_milliseconds(void)
 {
-	struct transfer *t = xfer->user_data;
-	t->in_flight = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static int it950x_stream_data(struct it950x_dev *dev, int fd)
 {
-	const long num_bufs = 16;
-	const long num_seconds = 2;
-	size_t buf_len;
-
-	struct transfer bufs[num_bufs];
-	int active = 0;
-	int i, r;
-
-	buf_len = num_seconds * dev->capacity_bps / 8;
-	buf_len /= num_bufs;
-	buf_len -= buf_len % 0xbc;
-
-	for (i = 0; i < num_bufs; i++) {
-		struct transfer *ab = &bufs[i];
-		ab->in_flight = 0;
-		ab->xfer = libusb_alloc_transfer(0);
-		ab->buf = malloc(buf_len);
-		if (!ab->buf) {
-			r = -ENOMEM;
-			goto err;
-		}
-	}
-
-	while (1) {
-		struct transfer *ab = &bufs[active];
-
-		while (ab->in_flight)
-			libusb_handle_events(NULL);
-
-		r = do_read(fd, ab->buf, buf_len);
-		if (r < buf_len) break;
-
-		ab->in_flight = 1;
-		libusb_fill_bulk_transfer(
-			ab->xfer, dev->dev, LIBUSB_ENDPOINT_OUT | 0x06,
-			ab->buf, buf_len,
-			it950x_buffer_done, ab,
-			10000);
-		r = libusb_submit_transfer(ab->xfer);
-		if (r != LIBUSB_SUCCESS) {
-			r = -EIO;
-			break;
-		}
-
-		active = (active + 1) % num_bufs;
-	}
-
-err:
-	return r;
+    unsigned char buf[EagleUser_USB20_FRAME_SIZE];
+    struct pollfd input = { .fd = fd, .events = POLLIN };
+    int used = 0, r, actual, eof = 0;
+    while (!stopping && !eof) {
+        int64_t deadline = used ? monotonic_milliseconds() + 10 : 0;
+        while (used < (int)sizeof(buf) && !stopping) {
+            int timeout = 5000;
+            if (used >= 188) {
+                int64_t remaining = deadline - monotonic_milliseconds();
+                if (remaining <= 0) break;
+                timeout = (int)remaining;
+            }
+            r = poll(&input, 1, timeout);
+            if (r < 0) { if (errno == EINTR) continue; return -errno; }
+            if (r == 0) {
+                if (used >= 188) break;
+                fprintf(stderr, "Input timeout (5 seconds)\n"); return -ETIMEDOUT;
+            }
+            r = read(fd, buf + used, sizeof(buf) - used);
+            if (r < 0) { if (errno == EINTR) continue; return -errno; }
+            if (r == 0) { eof = 1; break; }
+            used += r;
+            if (!deadline) deadline = monotonic_milliseconds() + 10;
+        }
+        if (stopping) break;
+        if (eof && used % 188) {
+            fprintf(stderr, "Input is not aligned to 188-byte TS packets\n"); return -EINVAL;
+        }
+        int complete = used / 188 * 188;
+        if (!complete) { if (eof) break; continue; }
+        for (int offset = 0; offset < complete; offset += 188)
+            if (buf[offset] != 0x47) { fprintf(stderr, "TS sync byte missing\n"); return -EINVAL; }
+        r = libusb_bulk_transfer(dev->dev, LIBUSB_ENDPOINT_OUT | 0x06,
+            buf, complete, &actual, 2000);
+        if (r != LIBUSB_SUCCESS || actual != complete) {
+            fprintf(stderr, "USB stream write: %s, %d/%d bytes\n", libusb_error_name(r), actual, complete);
+            return -EIO;
+        }
+        used -= complete;
+        if (used) memmove(buf, buf + complete, used);
+    }
+    return 0;
 }
 
 struct map {
@@ -1423,43 +1371,44 @@ static int lookup_map(struct map *map, size_t n, const char *str)
 static int usage(void)
 {
 	fprintf(stderr,
-		"usage: sendts-it9507 [OPTIONS]\n"
-		"\n"
-		"  -h,--help               Print this help\n"
-		"  -v,--verbose            Print more messages\n"
-		"  -D,--device             Specify USB device number\n"
-		"  -g,--gain               Set gain\n"
-		"  -f,--frequency          Set frequency (in kHz)\n"
-		"  -c,--channel            Set frequency (as channel no#)\n"
-		"  -b,--bandwidth          Set bandwidth in Hz (1000 - 8000)\n"
-		"  -t,--transmission-mode  Set transmission mode (2k/4k/8k)\n"
-		"  -C,--constellation      Set constellation (qpsk/qam16/qam64)\n"
-		"  -G,--guard-interval     Set guard interval (1/4,1/8,1/16,1/32)\n"
-		"  -r,--code-rate          Set code rate (1/2,2/3,3/4,5/6,7/8)\n"
-		"  -i,--cell-id            Set cell id (number)\n"
-		"  -m,--muxrate            Print calculted muxrate\n"
-		"\n");
-	return 1;
+		"usage: sendts-it9507 --list | --probe | --muxrate | --transmit [OPTIONS]\n"
+		"  --list                 List matching USB devices; no initialization\n"
+		"  --probe                Read firmware versions only; RF state unchanged\n"
+		"  --transmit             Explicitly enable RF and send stdin TS\n"
+		"  --serial SERIAL        Select a USB serial (preferred to enumeration index)\n"
+		"  -d,--device N          Select zero-based device index (default 0)\n"
+		"  -g,--gain DB           Relative gain -30..0 (default -10)\n"
+		"  -f,--frequency KHZ     Required for transmit (e.g. 474000)\n"
+		"  -b,--bandwidth KHZ     6000/7000/8000 (default 8000)\n"
+		"  -t,--transmission-mode 2k/8k (default 8k)\n"
+		"  -C,--constellation     qpsk/qam16/qam64 (default qam64)\n"
+		"  -G,--guard-interval    1/4,1/8,1/16,1/32 (default 1/4)\n"
+		"  -r,--code-rate         1/2,2/3,3/4,5/6,7/8 (default 2/3)\n"
+		"  -i,--cell-id N         0..65535 (default 0)\n"
+		"  -m,--muxrate           Calculate TS capacity in bits/s; no USB access\n"
+		"  -v,--verbose          More diagnostics\n"
+		"  -h,--help             This help\n");
+	return 2;
 }
 
-static const char *format_usb_ports(const uint8_t *ports, size_t n, char *fmt)
+static int number(const char *text, int low, int high)
 {
-	int i = 0, p = 0;
-	if (n == 0) {
-		fmt[0] = 0;
-		return fmt;
+	char *end;
+	long value;
+	errno = 0;
+	value = strtol(text, &end, 10);
+	if (errno || !*text || *end || value < low || value > high) {
+		fprintf(stderr, "Invalid numeric argument: %s (expected %d..%d)\n", text, low, high);
+		exit(2);
 	}
-	p += sprintf(fmt, "%u", ports[0]);
-	for (i = 1; i < n; i++)
-		p += sprintf(&fmt[p], ".%u", ports[i]);
-	return fmt;
+	return (int)value;
 }
 
 static long int it950x_calc_capacity(struct it950x_dev *dev)
 {
 	uint64_t capacity;
 
-	capacity = dev->bandwidth_hz * 1000;
+	capacity = dev->bandwidth_khz * 1000;
 
 	switch (dev->constellation) {
 	case IT950X_CONSTELLATION_QPSK:
@@ -1489,7 +1438,7 @@ static long int it950x_calc_capacity(struct it950x_dev *dev)
 		capacity = capacity * 4 / 5;
 		break;
 	default:
-		return 1;
+		return -1;
 	}
 
 	switch (dev->code_rate_hp) {
@@ -1511,132 +1460,140 @@ static long int it950x_calc_capacity(struct it950x_dev *dev)
 	default:
 		return -1;
 	}
-	dev->capacity_bps = capacity / 544 * 423;
+	dev->capacity_bps = capacity * 423 / 544;
 	return 0;
 }
 
 int main(int argc, char **argv)
 {
-	static const struct option long_options[] = {
-		{ "help",		no_argument, NULL, 'h' },
-		{ "verbose",		no_argument, NULL, 'v' },
-		{ "device",		required_argument, NULL, 'd' },
-		{ "gain",		required_argument, NULL, 'g' },
-		{ "frequency",		required_argument, NULL, 'f' },
-		{ "channel",		required_argument, NULL, 'c' },
-		{ "bandwidth",		required_argument, NULL, 'b' },
-		{ "transmission-mode",	required_argument, NULL, 't' },
-		{ "constellation",	required_argument, NULL, 'C' },
-		{ "guard-interval",	required_argument, NULL, 'G' },
-		{ "code-rate",		required_argument, NULL, 'r' },
-		{ "cell-id",		required_argument, NULL, 'i' },
-		{ "muxrate",		no_argument, NULL, 'm' },
+	enum { OPT_LIST = 256, OPT_PROBE, OPT_TRANSMIT, OPT_SERIAL };
+	static const struct option options[] = {
+		{ "help", no_argument, NULL, 'h' },
+		{ "verbose", no_argument, NULL, 'v' },
+		{ "device", required_argument, NULL, 'd' },
+		{ "gain", required_argument, NULL, 'g' },
+		{ "frequency", required_argument, NULL, 'f' },
+		{ "bandwidth", required_argument, NULL, 'b' },
+		{ "transmission-mode", required_argument, NULL, 't' },
+		{ "constellation", required_argument, NULL, 'C' },
+		{ "guard-interval", required_argument, NULL, 'G' },
+		{ "code-rate", required_argument, NULL, 'r' },
+		{ "cell-id", required_argument, NULL, 'i' },
+		{ "muxrate", no_argument, NULL, 'm' },
+		{ "list", no_argument, NULL, OPT_LIST },
+		{ "probe", no_argument, NULL, OPT_PROBE },
+		{ "transmit", no_argument, NULL, OPT_TRANSMIT },
+		{ "serial", required_argument, NULL, OPT_SERIAL },
+		{ NULL, 0, NULL, 0 }
 	};
-	static const char short_options[] = "hvd:g:f:c:b:t:C:G:r:i:m";
-
 	struct it950x_dev dev = {
-		.gain = -10,
-		.frequency_khz = 794000, /* Channel 68 */
-		.bandwidth_hz = 8000,
+		.gain = -10, .frequency_khz = 0, .bandwidth_khz = 8000,
 		.transmission_mode = IT950X_TRANSMISSION_MODE_8K,
 		.constellation = IT950X_CONSTELLATION_QAM_64,
 		.guard_interval = IT950X_GUARD_INTERVAL_1_4,
 		.code_rate_hp = IT950X_FEC_2_3,
-		.cell_id = 0,
 	};
 	libusb_context *ctx = NULL;
 	libusb_device **list = NULL;
-	struct libusb_device_descriptor desc;
-	const char *msg = NULL;
-	int i, r, opt, optindex;
-	int device_number = 0, matched = 0, rate_only = 0;
+	int mode = 0, modes = 0, opt, index = 0, matched = 0, r = 0;
+	int claimed = 0, status = 1, open_error = LIBUSB_ERROR_NO_DEVICE;
+	const char *serial = NULL;
 	ssize_t n;
-
-	optindex = 0;
-	while ((opt=getopt_long(argc, argv, short_options, long_options, &optindex)) > 0) {
+	while ((opt = getopt_long(argc, argv, "hvd:g:f:b:t:C:G:r:i:m", options, NULL)) != -1) {
 		switch (opt) {
 		case 'h': usage(); return 0;
 		case 'v': verbose++; break;
-		case 'd': device_number = atoi(optarg); break;
-		case 'g': dev.gain = atoi(optarg); break;
-		case 'f': dev.frequency_khz = atoi(optarg); break;
-		case 'c': dev.frequency_khz = 306000+8000*atoi(optarg); break;
-		case 'b': dev.bandwidth_hz = atoi(optarg); break;
+		case 'd': index = number(optarg, 0, 255); break;
+		case 'g': dev.gain = number(optarg, -30, 0); break;
+		case 'f': dev.frequency_khz = number(optarg, 174000, 862000); break;
+		case 'b': dev.bandwidth_khz = number(optarg, 6000, 8000); break;
+		case 'i': dev.cell_id = number(optarg, 0, 65535); break;
 		case 't': dev.transmission_mode = lookup_map(map_transmission_mode, ARRAY_SIZE(map_transmission_mode), optarg); break;
 		case 'C': dev.constellation = lookup_map(map_constellation, ARRAY_SIZE(map_constellation), optarg); break;
 		case 'G': dev.guard_interval = lookup_map(map_guard_interval, ARRAY_SIZE(map_guard_interval), optarg); break;
 		case 'r': dev.code_rate_hp = lookup_map(map_fec, ARRAY_SIZE(map_fec), optarg); break;
-		case 'm': rate_only = 1; break;
+		case OPT_SERIAL: serial = optarg; break;
+		case 'm': case OPT_LIST: case OPT_PROBE: case OPT_TRANSMIT: mode = opt; modes++; break;
 		default: return usage();
 		}
 	}
-
-	if (it950x_calc_capacity(&dev) < 0)
-		return usage();
-
-	if (rate_only) {
-		fprintf(stdout, "%ld\n", dev.capacity_bps);
-		return 0;
+	if (optind != argc || modes != 1 ||
+	    (dev.bandwidth_khz != 6000 && dev.bandwidth_khz != 7000 && dev.bandwidth_khz != 8000) ||
+	    (dev.transmission_mode != IT950X_TRANSMISSION_MODE_2K && dev.transmission_mode != IT950X_TRANSMISSION_MODE_8K) ||
+	    it950x_calc_capacity(&dev) < 0) return usage();
+	if (mode == 'm') { printf("%ld\n", dev.capacity_bps); return 0; }
+	if (mode == OPT_TRANSMIT && !dev.frequency_khz) {
+		fprintf(stderr, "--transmit requires an explicit --frequency in kHz\n"); return 2;
 	}
-
 	r = libusb_init(&ctx);
-	if (r != LIBUSB_SUCCESS) {
-		msg = "initialize usb library";
-		goto error;
+	if (r < 0) { fprintf(stderr, "libusb_init: %s\n", libusb_error_name(r)); goto done; }
+	n = libusb_get_device_list(ctx, &list);
+	if (n < 0) { fprintf(stderr, "USB enumeration: %s\n", libusb_error_name(n)); goto done; }
+	for (ssize_t i = 0; i < n; i++) {
+		struct libusb_device_descriptor desc;
+		libusb_device_handle *handle = NULL;
+		unsigned char usb_serial[256] = {0};
+		if (libusb_get_device_descriptor(list[i], &desc) < 0 || desc.idVendor != 0x048d || desc.idProduct != 0x9507) continue;
+		r = libusb_open(list[i], &handle);
+		if (!r && desc.iSerialNumber) libusb_get_string_descriptor_ascii(handle, desc.iSerialNumber, usb_serial, sizeof(usb_serial)-1);
+		if (mode == OPT_LIST) {
+			printf("#%d /dev/bus/usb/%03u/%03u 048d:9507 serial=%s access=%s\n", matched,
+				libusb_get_bus_number(list[i]), libusb_get_device_address(list[i]), usb_serial,
+				r ? libusb_error_name(r) : "ok");
+		} else if (!dev.dev && (serial ? !strcmp(serial, (char *)usb_serial) : matched == index)) {
+			open_error = r;
+			dev.dev = handle; handle = NULL;
+		}
+		if (handle) libusb_close(handle);
+		matched++;
 	}
-
-	r = n = libusb_get_device_list(ctx, &list);
-	if (r < 0) {
-		msg = "unable to enumerate usb devices";
-		goto error;
-	}
-
-	if (verbose) fprintf(stderr, "Devices:\n");
-	for (i = matched = 0; i < n; i++) {
-		uint8_t ports[8];
-		char fmt[ARRAY_SIZE(ports)*4];
-
-		libusb_get_device_descriptor(list[i], &desc);
-		r = libusb_get_port_numbers(list[i], ports, ARRAY_SIZE(ports));
-		if (desc.idVendor != 0x048D || desc.idProduct != 0x9507)
-			continue;
-
-		if (verbose)
-			fprintf(stderr, "#%d [%d-%d] %04x:%04x %s\n",
-				matched,
-				libusb_get_bus_number(list[i]),
-				libusb_get_device_address(list[i]),
-				desc.idVendor,
-				desc.idProduct,
-				format_usb_ports(ports, r, fmt));
-
-		if (matched == device_number)
-			libusb_open(list[i], &dev.dev);
-		matched ++;
-	}
-	libusb_free_device_list(list, 1);
-	if (verbose) fprintf(stderr, "\n");
-
-	if (!dev.dev) {
-		msg = "unable to open device";
-		r = LIBUSB_ERROR_OTHER;
-		goto error;
-	}
-
+	if (mode == OPT_LIST) { status = matched ? 0 : 1; if (!matched) fprintf(stderr, "No IT9507 USB devices visible\n"); goto done; }
+	if (!dev.dev) { fprintf(stderr, "Cannot open selected IT9507: %s (check USB mapping and permissions)\n", libusb_error_name(open_error)); goto done; }
+	/* Do not detach a driver or reset the USB device behind another application. */
 	r = libusb_claim_interface(dev.dev, 0);
-	if (r != LIBUSB_SUCCESS) {
-		msg = "failed to claim interface";
-		goto error;
+	if (r < 0) { fprintf(stderr, "USB claim interface: %s\n", libusb_error_name(r)); goto done; }
+	claimed = 1;
+	if (mode == OPT_PROBE) {
+		uint32_t link = it9507_get_fwver(&dev, Processor_LINK);
+		printf("LINK firmware: 0x%08x\n", link);
+		if (dev.error || link == 0xffffffffU) { fprintf(stderr, "LINK firmware query failed\n"); goto done; }
+		if (link == 0) {
+			printf("Cold device: firmware must be loaded into RAM during initialization.\n"
+			       "OFDM query skipped until firmware is running. RF state unchanged.\n");
+			status = 0; goto done;
+		}
+		uint32_t ofdm = it9507_get_fwver(&dev, Processor_OFDM);
+		printf("OFDM firmware: 0x%08x\n", ofdm);
+		if (dev.error || ofdm == 0xffffffffU) { fprintf(stderr, "OFDM firmware query failed\n"); goto done; }
+		printf("Probe complete: no RF configuration, firmware upload or reset performed.\n");
+		if (link != DVB_LINK_VERSION || ofdm != DVB_OFDM_VERSION)
+			fprintf(stderr, "Firmware differs from the upstream supported version; transmit is not yet validated.\n");
+		status = 0; goto done;
 	}
-
-	it950x_init(&dev);
+	struct sigaction action = { .sa_handler = stop_signal };
+	sigemptyset(&action.sa_mask);
+	sigaction(SIGINT, &action, NULL); sigaction(SIGTERM, &action, NULL);
+	r = it9507_oem_initialize(dev.dev);
+	if (r < 0) { fprintf(stderr, "OEM board initialization failed: %d\n", r); goto done; }
+	r = it950x_init(&dev);
+	if (r < 0) { fprintf(stderr, "IT9507 initialization failed: %d\n", r); goto done; }
+	fprintf(stderr, "RF enabled: %d kHz, bandwidth %d kHz, TS capacity %ld bits/s\n", dev.frequency_khz, dev.bandwidth_khz, dev.capacity_bps);
 	r = it950x_stream_data(&dev, STDIN_FILENO);
-	if (r < 0) fprintf(stderr, "streaming failed, r=%d\n", r);
-
-	libusb_close(dev.dev);
-error:
+	if (r < 0) fprintf(stderr, "Streaming failed: %s\n", strerror(-r));
+	status = r < 0 ? 1 : 0;
+done:
+	if (dev.configuration_started && claimed) {
+		dev.error = 0; /* Attempt shutdown even after an earlier transfer failure. */
+		r = it9507_disable_xmit(&dev);
+		if (r < 0) {
+			dev.error = 0;
+			it950x_wr_reg(&dev, Processor_LINK, GPIO_O(GPIOH2), 0);
+			fprintf(stderr, "RF shutdown could not be confirmed; disconnect USB if needed\n"); status = 1;
+		} else fprintf(stderr, "RF disabled\n");
+	}
+	if (claimed) libusb_release_interface(dev.dev, 0);
+	if (dev.dev) libusb_close(dev.dev);
+	if (list) libusb_free_device_list(list, 1);
 	if (ctx) libusb_exit(ctx);
-	if (!msg) return 0;
-	fprintf(stderr, "error: %s: %s\n", msg, libusb_error_name(r));
-	return 1;
+	return status;
 }

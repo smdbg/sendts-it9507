@@ -1,0 +1,2 @@
+# IT9507 transmitter: access for the video group; no world-writable USB nodes.
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="9507", MODE="0660", GROUP="video"
